@@ -1,0 +1,19 @@
+{
+	"comment": "",
+	"ignore": "test",
+	"package": [
+		{
+			"checksumSHA1": "033opfyzsdTu+gQKnmbGV6+1Pxs=",
+			"path": "github.com/apache/incubator-rocketmq-externals/rocketmq-go/util",
+			"revision": "383aeaecaa8699aad7eb06cc55a6fe0d031e440b",
+			"revisionTime": "2018-06-06T03:36:56Z"
+		},
+		{
+			"checksumSHA1": "HmbftipkadrLlCfzzVQ+iFHbl6g=",
+			"path": "github.com/golang/glog",
+			"revision": "23def4e6c14b4da8ac2ed8007337bc5eb5007998",
+			"revisionTime": "2016-01-25T20:49:56Z"
+		}
+	],
+	"rootPath": "github.com/zhiyangleecn/remotingcmd"
+}
