@@ -1,23 +1,39 @@
 package rcmd
 
 import (
-	"github.com/golang/glog"
-	"github.com/apache/incubator-rocketmq-externals/rocketmq-go/util"
-
 	"net"
 	"time"
 	"strconv"
 	"fmt"
 	"bytes"
+	"errors"
 	"encoding/binary"
-	"github.com/getlantern/errors"
+
+	"github.com/golang/glog"
+	"github.com/apache/incubator-rocketmq-externals/rocketmq-go/util"
+)
+
+const (
+	ProtocolNetEventChanMaxLen = 10000
+	ProtocolNetErrorEvent = 0
 )
 
 type InvokeCallback func(responseFuture *ResponseFuture)
+type CmdHandle func(conn net.Conn, protocol *Protocol) (interface{},error)
 
 type ProtocolNet struct {
-	responseTable  util.ConcurrentMap
-	cmdHandleTable util.ConcurrentMap
+	responseTable      util.ConcurrentMap
+	cmdHandlerTable    util.ConcurrentMap
+	defaultCmdHandler  CmdHandle
+	events             chan *ProtocolNetEvent
+	scanResponseTicker *time.Ticker
+	done               chan bool
+}
+
+type ProtocolNetEvent struct {
+	Type int
+	Conn net.Conn
+	Err  error
 }
 
 type ResponseFuture struct {
@@ -31,7 +47,18 @@ type ResponseFuture struct {
 	Done               chan bool
 }
 
-func (pn *ProtocolNet)SendSync(conn net.Conn, protocol Protocol, timeoutMillis int64) (*Protocol, error) {
+func NewProtocolNet() *ProtocolNet  {
+	return &ProtocolNet{
+		responseTable: util.New(),
+		cmdHandlerTable: util.New(),
+		defaultCmdHandler: nil,
+		events: make(chan *ProtocolNetEvent, ProtocolNetEventChanMaxLen),
+		scanResponseTicker: time.NewTicker(3 * time.Second),
+		done: make(chan bool),
+	}
+}
+
+func (pn *ProtocolNet)SendSync(conn net.Conn, protocol *Protocol, timeoutMillis int64) (*Protocol, error) {
 	responseFuture := NewDefaultResponseFuture(
 		protocol.ProtocolHeader.Seq,
 		timeoutMillis,
@@ -52,7 +79,7 @@ func (pn *ProtocolNet)SendSync(conn net.Conn, protocol Protocol, timeoutMillis i
 	}
 }
 
-func (pn *ProtocolNet)SendAsync(conn net.Conn, protocol Protocol, callback InvokeCallback, timeoutMillis int64) error {
+func (pn *ProtocolNet)SendAsync(conn net.Conn, protocol *Protocol, callback InvokeCallback, timeoutMillis int64) error {
 	responseFuture := NewDefaultResponseFuture(
 		protocol.ProtocolHeader.Seq,
 		timeoutMillis,
@@ -67,7 +94,7 @@ func (pn *ProtocolNet)SendAsync(conn net.Conn, protocol Protocol, callback Invok
 	return err
 }
 
-func (pn *ProtocolNet)SendOneWay(conn net.Conn, protocol Protocol) error  {
+func (pn *ProtocolNet)SendOneWay(conn net.Conn, protocol *Protocol) error  {
 	protocol.ProtocolHeader.SetFlag(OneWayFlag)
 	err := pn.sendProtocol(conn, protocol)
 	if err != nil {
@@ -77,7 +104,7 @@ func (pn *ProtocolNet)SendOneWay(conn net.Conn, protocol Protocol) error  {
 	return err
 }
 
-func (pn *ProtocolNet)sendProtocol(conn net.Conn, protocol Protocol) error {
+func (pn *ProtocolNet)sendProtocol(conn net.Conn, protocol *Protocol) error {
 	buf,err := protocol.ToBytes()
 	if err != nil {
 		return err
@@ -85,10 +112,21 @@ func (pn *ProtocolNet)sendProtocol(conn net.Conn, protocol Protocol) error {
 
 	_, err = conn.Write(buf)
 	if err != nil {
+		pn.putEvent(ProtocolNetErrorEvent, conn, err)
 		return err
 	}
 
 	return nil
+}
+
+func (pn *ProtocolNet)Start() {
+	t := time.NewTicker(3 * time.Second)
+	t.Stop()
+}
+
+func (pn *ProtocolNet)Stop()  {
+	close(pn.events)
+	pn.scanResponseTicker.Stop()
 }
 
 func (pn *ProtocolNet)ReceiveLoop(conn net.Conn) error {
@@ -103,6 +141,7 @@ func (pn *ProtocolNet)ReceiveLoop(conn net.Conn) error {
 
 		n, err := conn.Read(buf)
 		if err != nil {
+			pn.putEvent(ProtocolNetErrorEvent, conn, err)
 			return err
 		}
 
@@ -122,22 +161,23 @@ func (pn *ProtocolNet)ReceiveLoop(conn net.Conn) error {
 					}
 
 					needRedSize = false
-				}
-
-			} else {
-				break
-			}
-
-			if !needRedSize {
-
-				if protocolBuf.Len() < int(size) {
+				} else {
 					break;
 				}
 
 			}
 
+			if !needRedSize {
+
+				if protocolBuf.Len() + 4 < int(size) {
+					break
+				}
+
+			}
+
+			needRedSize = true
+
 			//读取协议头
-			binary.Read(protocolBuf, binary.BigEndian, &size)
 			binary.Read(protocolBuf, binary.BigEndian, &flag)
 			binary.Read(protocolBuf, binary.BigEndian, &cmdCode)
 			binary.Read(protocolBuf, binary.BigEndian, &version)
@@ -146,12 +186,12 @@ func (pn *ProtocolNet)ReceiveLoop(conn net.Conn) error {
 			//读取协议头后剩下的就是协议体
 			var bodyBuf []byte  = nil
 			if protocolBuf.Len() > 0 {
+				bodyBuf = make([]byte, protocolBuf.Len())
 				binary.Read(protocolBuf, binary.BigEndian, bodyBuf)
 			}
 
 			protocolHeader := NewProtocolHeader(flag, version, cmdCode, seq)
 			protocol := NewProtocol(protocolHeader, bodyBuf)
-
 			go pn.messageLoop(protocol, conn)
 
 		}
@@ -160,7 +200,29 @@ func (pn *ProtocolNet)ReceiveLoop(conn net.Conn) error {
 
 }
 
+func (pn *ProtocolNet)putEvent(eventType int, conn net.Conn, err error) {
+	if len(pn.events) <= ProtocolNetEventChanMaxLen {
+
+		event := &ProtocolNetEvent{
+			Type: eventType,
+			Conn: conn,
+			Err: err,
+		}
+		pn.events <- event
+
+	} else {
+
+		glog.Warningf("event chan is full, so event[%d] is drop", eventType)
+
+	}
+}
+
+func (pn *ProtocolNet)GetEvents() <-chan *ProtocolNetEvent{
+	return pn.events
+}
+
 func (pn *ProtocolNet)messageLoop(protocol *Protocol, conn net.Conn) {
+
 	if protocol.ProtocolHeader.IsResponse() {
 
 		pn.responseHandle(protocol, conn)
@@ -174,11 +236,32 @@ func (pn *ProtocolNet)messageLoop(protocol *Protocol, conn net.Conn) {
 
 func (pn *ProtocolNet)requestHandle(protocol *Protocol, conn net.Conn) {
 
-	//oneWay消息不需要回复响应
-	if !protocol.ProtocolHeader.IsOneWay() {
-
+	protocolHandler,_ := pn.getProtocolHandler(protocol.ProtocolHeader.CmdCode)
+	if protocolHandler == nil {
+		protocolHandler = pn.defaultCmdHandler
 	}
 
+	if protocolHandler == nil {
+
+		if !protocol.ProtocolHeader.IsOneWay() {
+			response := NewCmdResponse(ResponseSystemCodeNotSupported, protocol.ProtocolHeader.Seq, nil)
+			pn.sendProtocol(conn, response)
+		}
+
+	} else {
+
+		responseMessage, err := protocolHandler(conn, protocol)
+		if !protocol.ProtocolHeader.IsOneWay() {
+			if err != nil {
+				response := NewCmdResponse(ResponseSystemError, protocol.ProtocolHeader.Seq, nil)
+				pn.sendProtocol(conn, response)
+			} else {
+				response := NewCmdResponse(ResponseSuccess, protocol.ProtocolHeader.Seq, responseMessage)
+				pn.sendProtocol(conn, response)
+			}
+		}
+
+	}
 }
 
 func (pn *ProtocolNet)responseHandle(protocol *Protocol, conn net.Conn) {
@@ -193,6 +276,27 @@ func (pn *ProtocolNet)responseHandle(protocol *Protocol, conn net.Conn) {
 
 	responseFuture.ToSucceedAndExecuteCallback(protocol)
 
+}
+
+func (pn *ProtocolNet)getProtocolHandler(cmdCode int16) (CmdHandle,error) {
+	data ,result := pn.cmdHandlerTable.Get(strconv.Itoa(int(cmdCode)))
+	if !result {
+		return nil, errors.New("find cmd[" + strconv.Itoa(int(cmdCode)) + "] not found.")
+	}
+
+	return data.(CmdHandle), nil
+}
+
+func (pn *ProtocolNet)setDefaultProtocolHandler(handler CmdHandle)  {
+	pn.defaultCmdHandler = handler
+}
+
+func (pn *ProtocolNet)setProtocolHandler(cmdCode int16, handler CmdHandle) {
+	pn.cmdHandlerTable.Set(strconv.Itoa(int(cmdCode)), handler)
+}
+
+func (pn *ProtocolNet)removeProtocolHandler(cmdCode int16) {
+	pn.cmdHandlerTable.Remove(strconv.Itoa(int(cmdCode)))
 }
 
 func (pn *ProtocolNet)getResponse(seq int32) (*ResponseFuture, error) {

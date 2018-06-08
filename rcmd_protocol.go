@@ -4,6 +4,7 @@ import (
 	"bytes"
 	"encoding/binary"
 	"sync/atomic"
+	"encoding/json"
 )
 
 const (
@@ -34,7 +35,8 @@ type Protocol struct {
 	Body           []byte
 }
 
-func NewRequestProtocol(cmdCode int16, body []byte, isOneWay bool) *Protocol {
+func NewCmdRequest(cmdCode int16, body interface{}) *Protocol {
+
 	protocolHeader := NewProtocolHeader(
 		RequestFlag,
 		Version,
@@ -42,14 +44,12 @@ func NewRequestProtocol(cmdCode int16, body []byte, isOneWay bool) *Protocol {
 		atomic.AddInt32(&seq, 1),
 	)
 
-	if isOneWay {
-		protocolHeader.SetFlag(OneWayFlag)
-	}
-
-	return NewProtocol(protocolHeader, body)
+	bodyBuf,_ := json.Marshal(body)
+	return NewProtocol(protocolHeader, bodyBuf)
 }
 
-func NewResponseProtocol(cmdCode int16, seq int32, body []byte) *Protocol {
+func NewCmdResponse(cmdCode int16, seq int32, body interface{}) *Protocol  {
+
 	protocolHeader := NewProtocolHeader(
 		ResponseFlag,
 		Version,
@@ -57,7 +57,8 @@ func NewResponseProtocol(cmdCode int16, seq int32, body []byte) *Protocol {
 		seq,
 	)
 
-	return NewProtocol(protocolHeader, body)
+	bodyBuf,_ := json.Marshal(body)
+	return NewProtocol(protocolHeader, bodyBuf)
 }
 
 func NewProtocolHeader(flag int32, version int16, cmdCode int16, seq int32) *ProtocolHeader  {
@@ -109,6 +110,10 @@ func NewProtocol(protocolHeader *ProtocolHeader, body []byte) *Protocol  {
 
 func (p *Protocol) HeaderToBytes() []byte  {
 	return p.ProtocolHeader.ToBytes()
+}
+
+func (p *Protocol) BodyBytesTo(v interface{}) error  {
+	return json.Unmarshal(p.Body, v)
 }
 
 func (p *Protocol) ToBytes() ([]byte, error)  {
