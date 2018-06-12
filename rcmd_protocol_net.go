@@ -22,12 +22,14 @@ type InvokeCallback func(responseFuture *ResponseFuture)
 type CmdHandle func(conn net.Conn, protocol *Protocol) (interface{},error)
 
 type ProtocolNet struct {
-	responseTable      util.ConcurrentMap
-	cmdHandlerTable    util.ConcurrentMap
-	defaultCmdHandler  CmdHandle
-	events             chan *ProtocolNetEvent
-	scanResponseTicker *time.Ticker
-	done               chan bool
+	responseTable                        util.ConcurrentMap
+	cmdHandlerTable                      util.ConcurrentMap
+	defaultCmdHandler                    CmdHandle
+	events                               chan *ProtocolNetEvent
+	eventsEnable                         bool
+	eventsClosed                         bool
+	scanResponseTicker                   *time.Ticker
+	scanResponseTickerDone               chan bool
 }
 
 type ProtocolNetEvent struct {
@@ -38,23 +40,25 @@ type ProtocolNetEvent struct {
 
 type ResponseFuture struct {
 	ResponseProtocol *Protocol
-	Success           bool
-	Error             error
-	Seq               int32
-	TimeoutMillis     int64
-	InvokeCallback    InvokeCallback
-	BeginTimestamp    int64
-	Done               chan bool
+	Success          bool
+	Error            error
+	Seq              int32
+	TimeoutMillis    int64
+	InvokeCallback   InvokeCallback
+	BeginTimeMillis  int64
+	Done             chan bool
 }
 
-func NewProtocolNet() *ProtocolNet  {
+func NewProtocolNet(eventsEnable bool) *ProtocolNet  {
 	return &ProtocolNet{
 		responseTable: util.New(),
 		cmdHandlerTable: util.New(),
 		defaultCmdHandler: nil,
 		events: make(chan *ProtocolNetEvent, ProtocolNetEventChanMaxLen),
-		scanResponseTicker: time.NewTicker(3 * time.Second),
-		done: make(chan bool),
+		eventsEnable: eventsEnable,
+		eventsClosed: false,
+		scanResponseTicker: nil,
+		scanResponseTickerDone: make(chan bool),
 	}
 }
 
@@ -111,6 +115,7 @@ func (pn *ProtocolNet)sendProtocol(conn net.Conn, protocol *Protocol) error {
 	}
 
 	_, err = conn.Write(buf)
+	fmt.Printf("send request success,req[%d]\n", protocol.ProtocolHeader.Seq);
 	if err != nil {
 		pn.putEvent(ProtocolNetErrorEvent, conn, err)
 		return err
@@ -120,13 +125,48 @@ func (pn *ProtocolNet)sendProtocol(conn net.Conn, protocol *Protocol) error {
 }
 
 func (pn *ProtocolNet)Start() {
-	t := time.NewTicker(3 * time.Second)
-	t.Stop()
+	pn.scanResponseTicker = time.NewTicker(3 * time.Second)
+	go pn.startScanTimeoutResponse()
 }
 
 func (pn *ProtocolNet)Stop()  {
 	close(pn.events)
+	pn.eventsClosed = true
+
+	close(pn.scanResponseTickerDone)
 	pn.scanResponseTicker.Stop()
+}
+
+func (pn *ProtocolNet)startScanTimeoutResponse()  {
+	for {
+
+		select {
+		case <-pn.scanResponseTickerDone:
+			return
+		case <-pn.scanResponseTicker.C:
+			pn.scanTimeoutResponse()
+		}
+
+	}
+}
+
+func (pn *ProtocolNet)scanTimeoutResponse() {
+
+	for seq,responseObject := range pn.responseTable.Items() {
+
+		response := responseObject.(*ResponseFuture)
+		nowUnixMillis := time.Now().UnixNano() / int64(time.Millisecond)
+
+		if response.BeginTimeMillis + response.TimeoutMillis < nowUnixMillis {
+
+			fmt.Printf("response timeout remove[seq:%s]\n", seq)
+			pn.responseTable.Remove(seq)
+			response.ToFailedAndExecuteCallback(
+				response.ResponseProtocol,
+				fmt.Errorf(" timeout: %d Millisecond", response.TimeoutMillis))
+		}
+	}
+
 }
 
 func (pn *ProtocolNet)ReceiveLoop(conn net.Conn) error {
@@ -203,12 +243,14 @@ func (pn *ProtocolNet)ReceiveLoop(conn net.Conn) error {
 func (pn *ProtocolNet)putEvent(eventType int, conn net.Conn, err error) {
 	if len(pn.events) <= ProtocolNetEventChanMaxLen {
 
-		event := &ProtocolNetEvent{
-			Type: eventType,
-			Conn: conn,
-			Err: err,
+		if !pn.eventsClosed && pn.eventsEnable {
+			event := &ProtocolNetEvent{
+				Type: eventType,
+				Conn: conn,
+				Err: err,
+			}
+			pn.events <- event
 		}
-		pn.events <- event
 
 	} else {
 
@@ -318,14 +360,14 @@ func (pn *ProtocolNet)removeResponse(seq int32) {
 
 func NewDefaultResponseFuture(seq int32, timeoutMillis int64, invokeCallback InvokeCallback) *ResponseFuture  {
 	return &ResponseFuture{
-		ResponseProtocol:nil,
-		Success:false,
-		Error:nil,
-		Seq:seq,
-		TimeoutMillis:timeoutMillis,
-		InvokeCallback:invokeCallback,
-		BeginTimestamp: time.Now().Unix(),
-		Done:make(chan bool),
+		ResponseProtocol: nil,
+		Success:          false,
+		Error:            nil,
+		Seq:              seq,
+		TimeoutMillis:    timeoutMillis,
+		InvokeCallback:   invokeCallback,
+		BeginTimeMillis:  time.Now().UnixNano() / int64(time.Millisecond),
+		Done:             make(chan bool),
 	}
 }
 

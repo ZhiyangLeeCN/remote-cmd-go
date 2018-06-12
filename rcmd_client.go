@@ -4,6 +4,7 @@ package rcmd
 import (
 	"net"
 	"sync"
+	"fmt"
 )
 
 type RemoteCmdClient struct {
@@ -14,7 +15,7 @@ type RemoteCmdClient struct {
 }
 
 func NewRemoteCmdClient() (*RemoteCmdClient) {
-	protocolNet := NewProtocolNet()
+	protocolNet := NewProtocolNet(true)
 	remoteCmdClient := &RemoteCmdClient{
 		protocolNet: protocolNet,
 		connTable:  map[string]net.Conn{},
@@ -63,6 +64,7 @@ func (rcc *RemoteCmdClient)GetConnOrCreate(address string) (net.Conn, error)  {
 }
 
 func (rcc *RemoteCmdClient) GetConn(address string) (net.Conn)  {
+	fmt.Printf("get conn:%s\n", address)
 	defer rcc.connTableLock.RUnlock()
 	rcc.connTableLock.RLock()
 	return rcc.connTable[address]
@@ -80,7 +82,7 @@ func (rcc *RemoteCmdClient) CreateConn(address string) (net.Conn, error) {
 	if err != nil {
 		return nil, err
 	}
-	rcc.connTable[address] = conn
+	rcc.connTable[conn.RemoteAddr().String()] = conn
 	return conn, nil
 
 }

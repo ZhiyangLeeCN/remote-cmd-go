@@ -19,7 +19,7 @@ func NewRemoteCmdServer(address string) (*RemoteCmdServer, error) {
 		return nil, err
 	}
 
-	protocolNet := NewProtocolNet()
+	protocolNet := NewProtocolNet(false)
 
 	remoteCmdServer := &RemoteCmdServer{
 		listener: listen,
