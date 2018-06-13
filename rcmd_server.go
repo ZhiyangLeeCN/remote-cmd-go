@@ -63,7 +63,7 @@ func (rcs *RemoteCmdServer)Start() {
 				}
 			}
 
-			go rcs.protocolNet.ReceiveLoop(conn)
+			go rcs.protocolNet.receiveLoop(conn)
 		}
 
 	}()

@@ -19,6 +19,17 @@ const (
 	ResponseFlag = 0x2
 	//标识该请求是OneWay无需响应
 	OneWayFlag = 0x4
+
+	//协议总消息大小字段占用大小
+	ProtocolSizeFieldLen = 4
+	//协议标志位字段占用大小
+	ProtocolFlagFieldLen = 4
+	//协议版本字段占用大小
+	ProtocolVersionFieldLen = 2
+	//协议命令代码字段占用大小
+	ProtocolCmdCodeFieldLen = 2
+	//协议请求标识ID字段占用大小
+	ProtocolSeqFieldLen = 4
 )
 
 var seq int32

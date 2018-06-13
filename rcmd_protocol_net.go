@@ -7,6 +7,7 @@ import (
 	"fmt"
 	"bytes"
 	"errors"
+	"sync/atomic"
 	"encoding/binary"
 
 	"github.com/golang/glog"
@@ -30,6 +31,14 @@ type ProtocolNet struct {
 	eventsClosed                         bool
 	scanResponseTicker                   *time.Ticker
 	scanResponseTickerDone               chan bool
+	sendQueueClosed                      bool
+	sendQueue                            chan *SendProtocolTask
+}
+
+type SendProtocolTask struct {
+	conn           net.Conn
+	protocol       *Protocol
+	responseFuture *ResponseFuture
 }
 
 type ProtocolNetEvent struct {
@@ -39,6 +48,7 @@ type ProtocolNetEvent struct {
 }
 
 type ResponseFuture struct {
+	executed         int32
 	ResponseProtocol *Protocol
 	Success          bool
 	Error            error
@@ -59,6 +69,8 @@ func NewProtocolNet(eventsEnable bool) *ProtocolNet  {
 		eventsClosed: false,
 		scanResponseTicker: nil,
 		scanResponseTickerDone: make(chan bool),
+		sendQueueClosed: false,
+		sendQueue: make(chan *SendProtocolTask),
 	}
 }
 
@@ -69,7 +81,7 @@ func (pn *ProtocolNet)SendSync(conn net.Conn, protocol *Protocol, timeoutMillis 
 		nil,
 	)
 	pn.setResponse(protocol.ProtocolHeader.Seq, responseFuture)
-	err := pn.sendProtocol(conn, protocol)
+	err := pn.sendToQueue(conn, protocol, responseFuture)
 	if err != nil {
 		glog.Error(err)
 		return  nil,err
@@ -77,7 +89,11 @@ func (pn *ProtocolNet)SendSync(conn net.Conn, protocol *Protocol, timeoutMillis 
 
 	select {
 		case <-responseFuture.Done:
-			return responseFuture.ResponseProtocol, nil
+			if responseFuture.IsFailed() {
+				return nil, responseFuture.Error
+			} else {
+				return responseFuture.ResponseProtocol, nil
+			}
 		case <-time.After(time.Duration(timeoutMillis) * time.Millisecond):
 			return nil, fmt.Errorf("SendSync timeout: %d Millisecond", timeoutMillis)
 	}
@@ -90,7 +106,7 @@ func (pn *ProtocolNet)SendAsync(conn net.Conn, protocol *Protocol, callback Invo
 		callback,
 	)
 	pn.setResponse(protocol.ProtocolHeader.Seq, responseFuture)
-	err := pn.sendProtocol(conn, protocol)
+	err := pn.sendToQueue(conn, protocol, responseFuture)
 	if err != nil {
 		glog.Error(err)
 	}
@@ -98,9 +114,9 @@ func (pn *ProtocolNet)SendAsync(conn net.Conn, protocol *Protocol, callback Invo
 	return err
 }
 
-func (pn *ProtocolNet)SendOneWay(conn net.Conn, protocol *Protocol) error  {
+func (pn *ProtocolNet)SendOneWay(conn net.Conn, protocol *Protocol) error {
 	protocol.ProtocolHeader.SetFlag(OneWayFlag)
-	err := pn.sendProtocol(conn, protocol)
+	err := pn.sendToQueue(conn, protocol, nil)
 	if err != nil {
 		glog.Error(err)
 	}
@@ -108,33 +124,58 @@ func (pn *ProtocolNet)SendOneWay(conn net.Conn, protocol *Protocol) error  {
 	return err
 }
 
-func (pn *ProtocolNet)sendProtocol(conn net.Conn, protocol *Protocol) error {
-	buf,err := protocol.ToBytes()
-	if err != nil {
-		return err
+func (pn *ProtocolNet)sendToQueue(conn net.Conn, protocol *Protocol, future *ResponseFuture) error {
+	task := &SendProtocolTask{
+		conn: conn,
+		protocol: protocol,
+		responseFuture: future,
 	}
 
-	_, err = conn.Write(buf)
-	fmt.Printf("send request success,req[%d]\n", protocol.ProtocolHeader.Seq);
-	if err != nil {
-		pn.putEvent(ProtocolNetErrorEvent, conn, err)
-		return err
+	if pn.sendQueueClosed {
+		return errors.New("sendToQueue call fail[net is closed]")
+	} else {
+		pn.sendQueue <- task
+		return nil
 	}
+}
 
-	return nil
+func (pn *ProtocolNet)protocolSendLoop() {
+
+	for task := range pn.sendQueue  {
+
+		buf,err := task.protocol.ToBytes()
+		if err != nil {
+			if task.responseFuture != nil {
+				task.responseFuture.ToFailed(err)
+			}
+		}
+
+		_, err = task.conn.Write(buf)
+		if err != nil {
+			pn.putEvent(ProtocolNetErrorEvent, task.conn, err)
+			if task.responseFuture != nil {
+				task.responseFuture.ToFailed(err)
+			}
+		}
+
+	}
 }
 
 func (pn *ProtocolNet)Start() {
 	pn.scanResponseTicker = time.NewTicker(3 * time.Second)
 	go pn.startScanTimeoutResponse()
+	go pn.protocolSendLoop()
 }
 
 func (pn *ProtocolNet)Stop()  {
-	close(pn.events)
 	pn.eventsClosed = true
+	close(pn.events)
 
 	close(pn.scanResponseTickerDone)
 	pn.scanResponseTicker.Stop()
+
+	pn.sendQueueClosed = true
+	close(pn.sendQueue)
 }
 
 func (pn *ProtocolNet)startScanTimeoutResponse()  {
@@ -159,17 +200,15 @@ func (pn *ProtocolNet)scanTimeoutResponse() {
 
 		if response.BeginTimeMillis + response.TimeoutMillis < nowUnixMillis {
 
-			fmt.Printf("response timeout remove[seq:%s]\n", seq)
 			pn.responseTable.Remove(seq)
-			response.ToFailedAndExecuteCallback(
-				response.ResponseProtocol,
+			response.ToFailed(
 				fmt.Errorf(" timeout: %d Millisecond", response.TimeoutMillis))
 		}
 	}
 
 }
 
-func (pn *ProtocolNet)ReceiveLoop(conn net.Conn) error {
+func (pn *ProtocolNet) receiveLoop(conn net.Conn) error {
 
 	buf := make([]byte, 1024)
 
@@ -209,7 +248,7 @@ func (pn *ProtocolNet)ReceiveLoop(conn net.Conn) error {
 
 			if !needRedSize {
 
-				if protocolBuf.Len() + 4 < int(size) {
+				if protocolBuf.Len() + ProtocolSizeFieldLen < int(size) {
 					break
 				}
 
@@ -223,10 +262,18 @@ func (pn *ProtocolNet)ReceiveLoop(conn net.Conn) error {
 			binary.Read(protocolBuf, binary.BigEndian, &version)
 			binary.Read(protocolBuf, binary.BigEndian, &seq)
 
-			//读取协议头后剩下的就是协议体
 			var bodyBuf []byte  = nil
 			if protocolBuf.Len() > 0 {
-				bodyBuf = make([]byte, protocolBuf.Len())
+
+				//总大小减去协议头部字段占用大小就是body占用大小
+				bodyBuf = make([]byte,
+					size -
+					ProtocolSeqFieldLen -
+					ProtocolFlagFieldLen -
+					ProtocolCmdCodeFieldLen -
+					ProtocolVersionFieldLen -
+					ProtocolSeqFieldLen)
+
 				binary.Read(protocolBuf, binary.BigEndian, bodyBuf)
 			}
 
@@ -287,7 +334,7 @@ func (pn *ProtocolNet)requestHandle(protocol *Protocol, conn net.Conn) {
 
 		if !protocol.ProtocolHeader.IsOneWay() {
 			response := NewCmdResponse(ResponseSystemCodeNotSupported, protocol.ProtocolHeader.Seq, nil)
-			pn.sendProtocol(conn, response)
+			pn.sendToQueue(conn, response, nil)
 		}
 
 	} else {
@@ -296,10 +343,10 @@ func (pn *ProtocolNet)requestHandle(protocol *Protocol, conn net.Conn) {
 		if !protocol.ProtocolHeader.IsOneWay() {
 			if err != nil {
 				response := NewCmdResponse(ResponseSystemError, protocol.ProtocolHeader.Seq, nil)
-				pn.sendProtocol(conn, response)
+				pn.sendToQueue(conn, response, nil)
 			} else {
 				response := NewCmdResponse(ResponseSuccess, protocol.ProtocolHeader.Seq, responseMessage)
-				pn.sendProtocol(conn, response)
+				pn.sendToQueue(conn, response, nil)
 			}
 		}
 
@@ -316,7 +363,7 @@ func (pn *ProtocolNet)responseHandle(protocol *Protocol, conn net.Conn) {
 
 	pn.removeResponse(protocol.ProtocolHeader.Seq)
 
-	responseFuture.ToSucceedAndExecuteCallback(protocol)
+	responseFuture.ToSucceed(protocol)
 
 }
 
@@ -380,8 +427,11 @@ func (rf *ResponseFuture) IsFailed() bool  {
 }
 
 func (rf *ResponseFuture) ExecuteCallback() {
-	if rf.InvokeCallback != nil {
-		rf.InvokeCallback(rf)
+	if atomic.CompareAndSwapInt32(&rf.executed, 0, 1) {
+		close(rf.Done)
+		if rf.InvokeCallback != nil {
+			rf.InvokeCallback(rf)
+		}
 	}
 }
 
@@ -389,21 +439,12 @@ func (rf *ResponseFuture)ToSucceed(responseProtocol *Protocol) {
 	rf.ResponseProtocol = responseProtocol
 	rf.Success = true
 	rf.Error = nil
-	close(rf.Done)
-}
-
-func (rf *ResponseFuture)ToSucceedAndExecuteCallback(responseProtocol *Protocol) {
-	rf.ToSucceed(responseProtocol)
 	rf.ExecuteCallback()
 }
 
-func (rf *ResponseFuture)ToFailed(responseProtocol *Protocol, err error)  {
+func (rf *ResponseFuture)ToFailed(err error)  {
 	rf.ResponseProtocol = nil
 	rf.Success = false
 	rf.Error = err
-}
-
-func (rf *ResponseFuture)ToFailedAndExecuteCallback(responseProtocol *Protocol, err error)  {
-	rf.ToFailed(responseProtocol, err)
 	rf.ExecuteCallback()
 }
